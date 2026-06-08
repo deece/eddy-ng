@@ -466,8 +466,8 @@ class ProbeEddy:
         old_saved_reg_drive_current = asfc.getint(self._full_name, "saved_reg_drive_current", fallback=0)
         old_saved_tap_drive_current = asfc.getint(self._full_name, "saved_tap_drive_current", fallback=0)
 
-        self._reg_drive_current = self.params.reg_drive_current or old_saved_reg_drive_current or self._sensor._drive_current
-        self._tap_drive_current = self.params.tap_drive_current or old_saved_tap_drive_current or self._reg_drive_current
+        self._reg_drive_current = self.params.reg_drive_current or self._saved_reg_drive_current or old_saved_reg_drive_current or self._sensor._drive_current
+        self._tap_drive_current = self.params.tap_drive_current or self._saved_tap_drive_current or old_saved_tap_drive_current or self._reg_drive_current
 
         # at what minimum physical height to start homing. It must be above the safe start position,
         # because we need to move from the start through the safe start position
