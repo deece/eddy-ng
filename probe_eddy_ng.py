@@ -2048,6 +2048,11 @@ class ProbeEddy:
         result = self.probe_static_height()
         self._tap_offset = float(self.params.home_trigger_height - result.value)
 
+        # Restore XY position to where the tap was performed
+        th.manual_move([None, None, self.params.home_trigger_height + 1.0], lift_speed)
+        th.manual_move([th_now[0], th_now[1], None], self.params.move_speed)
+        th.wait_moves()
+
         self._log_msg(
             f"Probe computed tap at {computed_tap_z:.3f} (tap at z={tap_z:.3f}, "
             f"stddev {tap_stddev:.3f}) with {samples} samples, {homed_to_str}"
