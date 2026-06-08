@@ -683,6 +683,34 @@ class ProbeEddy:
             return None
         return th_pos[2]
 
+    def get_default_butter_sos(self, data_rate: int) -> Optional[List[List[float]]]:
+        """
+        Returns the pre-calculated Second-Order Sections (SOS) matrix for the default
+        bandpass Butterworth filter at standard data rates (250Hz or 500Hz).
+
+        This acts as a fallback to avoid dependency on scipy on lightweight host systems.
+        The coefficients are calculated using scipy:
+            scipy.signal.butter(
+                N=params.tap_butter_order (default 4),
+                Wn=[params.tap_butter_lowcut (default 2), params.tap_butter_highcut (default 20)],
+                btype='bandpass',
+                fs=data_rate,
+                output='sos'
+            )
+        Each section has the format [b0, b1, b2, a0, a1, a2].
+        """
+        if data_rate == 250:
+            return [
+                [ 0.046131802093312926, 0.09226360418662585, 0.046131802093312926, 1.0, -1.3297767184682712, 0.5693902189294331, ],
+                [ 1.0, -2.0, 1.0, 1.0, -1.845000600983779, 0.8637525213328747, ],
+            ]
+        elif data_rate == 500:
+            return [
+                [ 0.013359200027856505, 0.02671840005571301, 0.013359200027856505, 1.0, -1.686278256753083, 0.753714473246724, ],
+                [ 1.0, -2.0, 1.0, 1.0, -1.9250515947328444, 0.9299234737648037, ],
+            ]
+        return None
+
     def current_drive_current(self) -> int:
         return self._sensor.get_drive_current()
 
@@ -1170,32 +1198,53 @@ class ProbeEddy:
         debug = 1 if self.params.debug else 0
         debug = gcmd.get_int("DEBUG", debug) == 1
 
+        old_drive_current = self.current_drive_current()
+        cal_z_max: float = self.params.calibration_z_max
+        # Cap calibration Z max to 7.0 so that the maximum height (including 3.0mm backlash lift) is exactly 10.0mm
+        cal_z_max = min(7.0, cal_z_max)
+        z_target = 0.0
+
         # We just did a ManualProbeHelper, so we're going to zero the z-axis
         # to make the following code easier, so it can assume z=0 is actually real zero.
+        # The Eddy sensor calibration is done to nozzle height (not sensor or trigger height).
         th = self._printer.lookup_object("toolhead")
         th_pos = th.get_position()
         th_pos[2] = 0.0
         self._set_toolhead_position(th_pos, [2])
+        th.wait_moves()
 
-        # Note that the default is the default drive current
-        drive_current: int = gcmd.get_int(
-            "DRIVE_CURRENT",
-            self._sensor._default_drive_current,
-            minval=0,
-            maxval=31,
-        )
+        # 1. Determine valid drive currents at the bed (Z=0.0)
+        self._log_msg("Checking valid drive currents at the bed (Z=0.0)...")
+        dc_to_test = list(range(32))
+        # For Z=0.0 (sensor is very close to the bed), we exclude ERR_ALE (Amplitude Low, bit 9)
+        # and ERR_UR (Under-range, bit 13) because heavy loading near metal is expected and handled.
+        error_mask_zero = (1 << 10) | (1 << 11) | (1 << 12)  # ERR_AHE, ERR_WD, ERR_OR
+        valid_at_zero = []
+        for dc in dc_to_test:
+            self._sensor.set_drive_current(dc)
+            th.dwell(0.100)
+            th.wait_moves()
+            is_valid = True
+            for _ in range(5):
+                val = self._sensor.read_one_value()
+                if val.freq <= 0.0 or (val.status & error_mask_zero) != 0:
+                    is_valid = False
+                    break
+                th.dwell(0.020)
+                th.wait_moves()
+            if is_valid:
+                valid_at_zero.append(dc)
 
-        max_dc_increase = 0
-        if self._sensor_type == "ldc1612" or self._sensor_type == "btt_eddy" or self._sensor_type == "ldc1612_internal_clk":
-            max_dc_increase = 5
-        max_dc_increase = gcmd.get_int("MAX_DC_INCREASE", max_dc_increase, minval=0, maxval=30)
+        self._sensor.set_drive_current(old_drive_current)
+        self._log_msg(f"Drive currents valid at Z=0.0: {valid_at_zero}")
+        if not valid_at_zero:
+            self._log_error("No valid drive currents detected at Z=0.0")
+            self._z_not_homed()
+            return
 
         # lift up above cal_z_max, and then move over so the probe
         # is over the nozzle position
-        th.manual_move(
-            [None, None, self.params.calibration_z_max + 3.0],
-            self.params.lift_speed,
-        )
+        th.manual_move([None, None, cal_z_max + 3.0], self.params.lift_speed)
         th.manual_move(
             [
                 th_pos[0] - self.offset["x"],
@@ -1204,93 +1253,239 @@ class ProbeEddy:
             ],
             self.params.move_speed,
         )
+        th.wait_moves()
 
-        # This is going to automate setup.
-        # The setup state machine looks like this:
-        # 1. Finding homing drive current
-        # 2. Finding tapping drive current
-        FINDING_HOMING = 1
-        FINDING_TAP = 2
-        DONE = 3
+        # 2. Verify drive currents at Z = cal_z_max + 3.0
+        self._log_msg(f"Checking candidate drive currents at Z={cal_z_max + 3.0:.1f}...")
+        error_mask_far = (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12) | (1 << 13)
+        valid_at_far = []
+        for dc in dc_to_test:
+            self._sensor.set_drive_current(dc)
+            th.dwell(0.100)
+            th.wait_moves()
+            is_valid = True
+            for _ in range(5):
+                val = self._sensor.read_one_value()
+                if val.freq <= 0.0 or (val.status & error_mask_far) != 0:
+                    is_valid = False
+                    break
+                th.dwell(0.020)
+                th.wait_moves()
+            if is_valid:
+                valid_at_far.append(dc)
 
-        start_drive_current = drive_current
-        result_msg = None
+        self._sensor.set_drive_current(old_drive_current)
+        self._log_msg(f"Drive currents valid at Z={cal_z_max + 3.0:.1f}: {valid_at_far}")
 
-        self._log_msg("setup: calibrating homing")
-        state = FINDING_HOMING
-        while state < DONE:
-            mapping, fth_rms, htf_rms = self._create_mapping(
-                self.params.calibration_z_max,
-                0.0,  # z_target
+        valid_currents = sorted(list(set(valid_at_zero) | set(valid_at_far)))
+        self._log_msg(f"Drive currents to calibrate (union of valid ranges): {valid_currents}")
+        if not valid_currents:
+            self._log_error("No valid drive currents detected at Z=0.0 or Z=10.0")
+            self._z_not_homed()
+            return
+
+        # 3. Calibrate all valid drive currents
+        calibrated_mappings = {}
+        for dc in valid_currents:
+            self._log_msg(f"Calibrating drive current {dc}...")
+            mapping, fth_fit, htf_fit = self._create_mapping(
+                cal_z_max,
+                z_target,
                 self.params.probe_speed,
                 self.params.lift_speed,
-                drive_current,
-                report_errors=debug,
+                dc,
+                report_errors=False,
                 write_debug_files=debug,
             )
+            if mapping is None or fth_fit is None or htf_fit is None:
+                self._log_msg(f"  Drive current {dc}: Calibration failed to fit mapping")
+                continue
 
-            homing_req_min = 0.5
-            homing_req_max = 5.0
-            tap_req_min = 0.025
-            tap_req_max = 3.0
+            calibrated_mappings[dc] = (mapping, fth_fit)
+            self._dc_to_fmap[dc] = mapping
+            self._log_msg(f"  Drive current {dc}: Calibrated successfully")
 
-            ok_for_homing = mapping is not None
-            ok_for_tap = mapping is not None
+        # 4. Select homing and tap drive currents
+        homing_req_min = 0.5
+        homing_req_max = min(
+            self.params.home_trigger_height + self.params.home_trigger_safe_start_offset + 1.0,
+            cal_z_max
+        )
+        tap_req_min = 0.025
+        # Require tap candidates to support at least tap_start_z + 0.5 to allow for safety margin and backlash moves
+        tap_req_max = max(
+            self.params.home_trigger_height,
+            self.params.tap_trigger_safe_start_height,
+            self.params.tap_start_z + 0.5
+        )
 
-            if ok_for_homing and (mapping.height_range[0] > homing_req_min or mapping.height_range[1] < homing_req_max):
+        self._log_msg(
+            f"Evaluating drive currents (Homing req: Z={homing_req_min}..{homing_req_max:.2f}mm, "
+            f"Tap req: Z={tap_req_min}..{tap_req_max:.2f}mm):"
+        )
+
+        valid_homing_candidates = []
+        valid_tap_candidates = []
+
+        for dc in sorted(calibrated_mappings.keys()):
+            mapping, fth_rms = calibrated_mappings[dc]
+
+            # Check if ok for homing
+            ok_for_homing = True
+            if mapping.height_range[0] > homing_req_min or mapping.height_range[1] < homing_req_max:
                 ok_for_homing = False
-            if ok_for_tap and (mapping.height_range[0] > tap_req_min or mapping.height_range[1] < tap_req_max):
+            if mapping.freq_spread() < 0.30:
+                ok_for_homing = False
+            if fth_rms is None or fth_rms > 0.025:
+                ok_for_homing = False
+
+            # Check if ok for tap
+            ok_for_tap = True
+            if mapping.height_range[0] > tap_req_min or mapping.height_range[1] < tap_req_max:
+                ok_for_tap = False
+            if mapping.freq_spread() < 0.30:
+                ok_for_tap = False
+            if fth_rms is None or fth_rms > 0.025:
                 ok_for_tap = False
 
-            if ok_for_homing or ok_for_tap:
-                self._log_info(f"dc {drive_current} homing {ok_for_homing} tap {ok_for_tap}, {fth_rms} {htf_rms}")
-                if mapping.freq_spread() < 0.30:
-                    self._log_warning(
-                        f"frequency spread {mapping.freq_spread()} is very low at drive current {drive_current}. (The sensor is probably mounted too high; the height includes any case thickness.)"
-                    )
-                    ok_for_homing = ok_for_tap = False
-                if fth_rms is None or fth_rms > 0.025:
-                    self._log_msg(f"calibration error rate is too high ({fth_rms}) at drive current {drive_current}.")
-                    ok_for_homing = ok_for_tap = False
+            self._log_msg(
+                f"  Drive current {dc}: range={mapping.height_range[0]:.3f}..{mapping.height_range[1]:.3f}mm, "
+                f"spread={mapping.freq_spread():.2f}%, fit_rms={fth_rms:.4f} -> "
+                f"homing={ok_for_homing}, tap={ok_for_tap}"
+            )
 
-            if state == FINDING_HOMING and ok_for_homing:
-                self._dc_to_fmap[drive_current] = mapping
-                self._reg_drive_current = drive_current
-                self._log_msg(f"using {drive_current} for homing.")
-                state = FINDING_TAP
+            if ok_for_homing:
+                valid_homing_candidates.append(dc)
+            if ok_for_tap:
+                valid_tap_candidates.append(dc)
 
-            if state == FINDING_TAP and ok_for_tap:
-                self._dc_to_fmap[drive_current] = mapping
-                self._tap_drive_current = drive_current
-                self._log_msg(f"using {drive_current} for tap.")
-                state = DONE
-
-            if state == DONE:
-                result_msg = "Setup success. Please check whether homing works with G28 Z, then check if tap works with PROBE_EDDY_NG_TAP."
-                break
-
-            if drive_current - start_drive_current >= max_dc_increase:
-                # we've failed completely
-                if state == FINDING_HOMING:
-                    result_msg = "Failed to find homing drive current. (Have you checked the sensor height?)"
-                elif state == FINDING_TAP:
-                    result_msg = "Failed to find tap drive current, but homing is set up. (Have you checked the sensor height?)"
-                else:
-                    result_msg = "Unknown state?"
-                break
-
-            # increase DC and keep going
-            drive_current += 1
-
-        if state == DONE:
-            self._log_msg(result_msg)
+        chosen_homing = None
+        if valid_homing_candidates:
+            # Optimal homing: lowest valid drive current (widest height range)
+            chosen_homing = valid_homing_candidates[0]
+            self._reg_drive_current = chosen_homing
+            self._log_msg(f"using {chosen_homing} for homing (lowest valid).")
         else:
-            self._log_error(result_msg)
+            self._log_warning("Could not find any drive current suitable for homing.")
 
-        if state > FINDING_HOMING:
-            self.reset_drive_current()
+        chosen_tap = None
+        if valid_tap_candidates:
+            # Optimal tap: highest valid drive current (highest near-bed sensitivity)
+            chosen_tap = valid_tap_candidates[-1]
+            self._log_msg(f"calculated tap drive current candidate: {chosen_tap}")
+
+            # Construct TapConfig for scanning
+            mode = self.params.tap_mode
+            tap_threshold = self.params.tap_threshold
+            tapcfg = ProbeEddy.TapConfig(mode=mode, threshold=tap_threshold)
+            if mode == "butter":
+                sos = None
+                if self.params.is_default_butter_config():
+                    sos = self.get_default_butter_sos(self._sensor._data_rate)
+                if sos is None:
+                    if scipy:
+                        sos = scipy.signal.butter(
+                            self.params.tap_butter_order,
+                            [ self.params.tap_butter_lowcut, self.params.tap_butter_highcut, ],
+                            btype="bandpass",
+                            fs=self._sensor._data_rate,
+                            output="sos",
+                        ).tolist()
+                    else:
+                        raise self._printer.command_error("Scipy is not available, cannot use custom filter, or data rate is not 250 or 500")
+                tapcfg.sos = sos
+
+            # Scan the calculated drive current +/- 2
+            tap_candidates = []
+            for dc in range(chosen_tap - 2, chosen_tap + 3):
+                if 1 <= dc <= 31 and dc in calibrated_mappings:
+                    tap_candidates.append(dc)
+
+            self._log_msg(f"Scanning tap viability around calculated drive current {chosen_tap} (candidates: {tap_candidates})...")
+            working_tap_currents = []
+            for dc in tap_candidates:
+                tap_map = calibrated_mappings[dc][0]
+                start_z = min(self.params.tap_start_z, tap_map.height_range[1] - 0.1)
+                start_z = max(start_z, self.params.home_trigger_height + 0.1)
+                target_z = self.params.tap_target_z
+
+                self._log_msg(f"  Testing tap viability for drive current {dc} (start_z={start_z:.3f}, target_z={target_z:.3f})...")
+                try:
+                    success_count = 0
+                    last_err = None
+                    for attempt in range(1, 6):
+                        tap_res = self.do_one_tap(
+                            start_z=start_z,
+                            target_z=target_z,
+                            tap_speed=self.params.tap_speed,
+                            lift_speed=self.params.lift_speed,
+                            tapcfg=tapcfg,
+                            drive_current=dc,
+                        )
+
+                        if tap_res.error is None:
+                            success_count += 1
+                            self._log_msg(f"    Attempt {attempt}: Tap SUCCEEDED (z={tap_res.probe_z:.3f}, overshoot={tap_res.overshoot:.3f})")
+                        else:
+                            last_err = tap_res.error
+                            self._log_msg(f"    Attempt {attempt}: Tap FAILED ({tap_res.error})")
+
+                        th.dwell(0.100)
+                        th.wait_moves()
+
+                    if success_count >= 3:
+                        working_tap_currents.append(dc)
+                        self._log_msg(f"    Drive current {dc}: Tap SUCCEEDED overall ({success_count}/5 attempts succeeded)")
+                    else:
+                        self._log_msg(f"    Drive current {dc}: Tap FAILED overall ({success_count}/5 attempts succeeded, last error: {last_err})")
+                except Exception as e:
+                    self._log_msg(f"    Drive current {dc}: Tap exception ({e})")
+
+            self._log_msg(f"Working drive currents for tap: {working_tap_currents}")
+            if working_tap_currents:
+                highest_working = working_tap_currents[-1]
+                self._tap_drive_current = highest_working
+                self._log_msg(f"Selected highest working drive current {highest_working} for tap.")
+            else:
+                self._log_warning(
+                    f"None of the tested drive currents in range {tap_candidates} worked for tap. "
+                    f"Falling back to calculated chosen_tap: {chosen_tap}."
+                )
+                self._tap_drive_current = chosen_tap
+
+            # Automatically update tap_start_z to a conservative value within the range
+            tap_map = calibrated_mappings[self._tap_drive_current][0]
+            suggested_start_z = math.floor(tap_map.height_range[1] * 10.0) / 10.0 - 0.1
+            suggested_start_z = max(suggested_start_z, self.params.home_trigger_height + 0.1)
+            self.params.tap_start_z = min(self.params.tap_start_z, suggested_start_z)
+            self._log_msg(f"Automatically set tap_start_z to conservative value: {self.params.tap_start_z:.2f}mm")
+        else:
+            self._log_warning("Could not find any drive current suitable for tap.")
+
+        if calibrated_mappings:
             self.save_config()
 
+            # Show summary of all the ranges at each drive strength, and the selected drive strength for homing, and tap
+            self._log_msg("\n================== EDDY-ng Calibration Summary ==================")
+            for dc in sorted(calibrated_mappings.keys()):
+                mapping, fth_rms = calibrated_mappings[dc]
+                self._log_msg(
+                    f"  Drive Current {dc:2d}: Range = {mapping.height_range[0]:.3f} to {mapping.height_range[1]:.3f} mm, "
+                    f"Fit RMS = {fth_rms:.4f}, Freq Spread = {mapping.freq_spread():.2f}%"
+                )
+            self._log_msg("-----------------------------------------------------------------")
+            self._log_msg(f"  Selected Homing Drive Current: {chosen_homing}")
+            self._log_msg(f"  Selected Tap Drive Current:    {self._tap_drive_current}")
+            self._log_msg("=================================================================\n")
+
+            if chosen_homing is not None and chosen_tap is not None:
+                self._log_msg("Setup success. Homing and tap viability have been verified. Please issue SAVE_CONFIG to save calibration data and restart.")
+            else:
+                self._log_error("Setup completed but did not find suitable drive currents for both homing and tap.")
+        else:
+            self._log_error("Setup failed: Calibration failed for all candidate drive currents")
+
+        self.reset_drive_current()
         self._z_not_homed()
 
     cmd_CALIBRATE_help = (
@@ -1919,26 +2114,20 @@ class ProbeEddy:
         tapcfg = ProbeEddy.TapConfig(mode=mode, threshold=tap_threshold)
         # fmt: off
         if mode == "butter":
-            if self.params.is_default_butter_config() and self._sensor._data_rate == 250:
-                sos = [
-                    [ 0.046131802093312926, 0.09226360418662585, 0.046131802093312926, 1.0, -1.3297767184682712, 0.5693902189294331, ],
-                    [ 1.0, -2.0, 1.0, 1.0, -1.845000600983779, 0.8637525213328747, ],
-                ]
-            elif self.params.is_default_butter_config() and self._sensor._data_rate == 500:
-                sos = [
-                    [ 0.013359200027856505, 0.02671840005571301, 0.013359200027856505, 1.0, -1.686278256753083, 0.753714473246724, ],
-                    [ 1.0, -2.0, 1.0, 1.0, -1.9250515947328444, 0.9299234737648037, ],
-                ]
-            elif scipy:
-                sos = scipy.signal.butter(
-                    self.params.tap_butter_order,
-                    [ self.params.tap_butter_lowcut, self.params.tap_butter_highcut, ],
-                    btype="bandpass",
-                    fs=self._sensor._data_rate,
-                    output="sos",
-                ).tolist()
-            else:
-                raise self._printer.command_error("Scipy is not available, cannot use custom filter, or data rate is not 250 or 500")
+            sos = None
+            if self.params.is_default_butter_config():
+                sos = self.get_default_butter_sos(self._sensor._data_rate)
+            if sos is None:
+                if scipy:
+                    sos = scipy.signal.butter(
+                        self.params.tap_butter_order,
+                        [ self.params.tap_butter_lowcut, self.params.tap_butter_highcut, ],
+                        btype="bandpass",
+                        fs=self._sensor._data_rate,
+                        output="sos",
+                    ).tolist()
+                else:
+                    raise self._printer.command_error("Scipy is not available, cannot use custom filter, or data rate is not 250 or 500")
             tapcfg.sos = sos
         # fmt: on
 
