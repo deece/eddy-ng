@@ -1074,11 +1074,44 @@ class ProbeEddy:
             self._sensor.set_drive_current(old_drive_current)
 
     cmd_SETUP_help = (
-        "Setup the eddy current sensor. Specify NOHOME=1 to suppress homing X & Y and "
+        "Setup the eddy current sensor. Specify FILAMENT=<type> (PLA, PETG, TPU, ABS, ASA) or "
+        "TARGET_TEMP=<temp> to preheat the bed. Specify NOHOME=1 to suppress homing X & Y and "
         "centering before setup."
     )
 
     def cmd_SETUP(self, gcmd: GCodeCommand):
+        filament = gcmd.get("FILAMENT", None)
+        target_temp = gcmd.get_float("TARGET_TEMP", None)
+
+        if target_temp is None and filament is None:
+            raise self._printer.command_error(
+                "Please specify FILAMENT (PLA, PETG, TPU, ABS, ASA) or TARGET_TEMP. "
+                "Example: PROBE_EDDY_NG_SETUP FILAMENT=PLA"
+            )
+
+        if target_temp is not None:
+            if target_temp < 0.0 or target_temp > 130.0:
+                raise self._printer.command_error("TARGET_TEMP must be between 0 and 130")
+
+        if target_temp is None:
+            filament = filament.strip().lower()
+            filament_temps = {
+                "pla": 60.0,
+                "petg": 80.0,
+                "tpu": 50.0,
+                "abs": 110.0,
+                "asa": 110.0,
+            }
+            if filament not in filament_temps:
+                raise self._printer.command_error(
+                    f"Unknown filament '{filament}'. Supported: {', '.join(sorted(filament_temps.keys()))}"
+                )
+            target_temp = filament_temps[filament]
+
+        if target_temp > 0.0:
+            self._log_msg(f"Preheating bed to target temperature {target_temp:.1f}C for calibration...")
+            self._gcode.run_script_from_command(f"M190 S{target_temp:.0f}")
+
         nohome = gcmd.get_int("NOHOME", 0) != 0
         if not nohome:
             if self._z_homed():
