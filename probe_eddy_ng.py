@@ -1677,10 +1677,13 @@ class ProbeEddy:
 
         th.wait_moves()
 
-    #
-    # Tap probe
-    #
-    cmd_TAP_help = "Calculate a z-offset by touching the build plate."
+    cmd_TAP_help = (
+        "Calculate a z-offset by touching the build plate. "
+        "Optional parameters: DRIVE_CURRENT (1-31), SPEED, RETRACT_SPEED, START_Z, "
+        "TARGET_Z, THRESHOLD (or TT), ADJUST_Z, RETRACT (0 or 1), SAMPLES, "
+        "MAX_SAMPLES, SAMPLES_STDDEV, USE_MEDIAN (0 or 1), HOME_Z (0 or 1), "
+        "PLOT (0, 1, or 2), MODE (wma or butter)."
+    )
 
     def cmd_TAP(self, gcmd: GCodeCommand):
         drive_current = self._sensor.get_drive_current()
