@@ -3203,9 +3203,13 @@ class ProbeEddyFrequencyMap:
         if self._ftoh is None:
             raise self._eddy._printer.command_error("Calling freq_to_height on uncalibrated map")
         invfreq = 1.0 / freq
-        if self._ftoh_high is not None and invfreq < self._ftoh.domain[0]:
-            return float(self._ftoh_high(invfreq))
-        return float(self._ftoh(invfreq))
+        if self._ftoh_high is not None and invfreq > self._ftoh.domain[1]:
+            invfreq_cap = min(invfreq, self._ftoh_high.domain[1])
+            invfreq_cap = max(invfreq_cap, self._ftoh_high.domain[0])
+            return float(self._ftoh_high(invfreq_cap))
+        invfreq_cap = min(invfreq, self._ftoh.domain[1])
+        invfreq_cap = max(invfreq_cap, self._ftoh.domain[0])
+        return float(self._ftoh(invfreq_cap))
 
     def freqs_to_heights_np(self, freqs: np.array) -> np.array:
         if self._ftoh is None:
@@ -3214,10 +3218,21 @@ class ProbeEddyFrequencyMap:
         if self._ftoh_high is not None:
             heights = np.zeros(len(invfreqs))
             low_freq_vals = invfreqs > self._ftoh.domain[1]
-            heights[low_freq_vals] = np.vectorize(self._ftoh_high, otypes=[float])(invfreqs[low_freq_vals])
-            heights[~low_freq_vals] = np.vectorize(self._ftoh, otypes=[float])(invfreqs[~low_freq_vals])
+
+            # High Z values (low frequency)
+            high_inv = invfreqs[low_freq_vals]
+            if len(high_inv) > 0:
+                high_inv_cap = np.clip(high_inv, self._ftoh_high.domain[0], self._ftoh_high.domain[1])
+                heights[low_freq_vals] = np.vectorize(self._ftoh_high, otypes=[float])(high_inv_cap)
+
+            # Low Z values (high frequency)
+            low_inv = invfreqs[~low_freq_vals]
+            if len(low_inv) > 0:
+                low_inv_cap = np.clip(low_inv, self._ftoh.domain[0], self._ftoh.domain[1])
+                heights[~low_freq_vals] = np.vectorize(self._ftoh, otypes=[float])(low_inv_cap)
         else:
-            heights = self._ftoh(invfreqs)
+            invfreqs_cap = np.clip(invfreqs, self._ftoh.domain[0], self._ftoh.domain[1])
+            heights = self._ftoh(invfreqs_cap)
         return heights
 
     def height_to_freq(self, height: float) -> float:
