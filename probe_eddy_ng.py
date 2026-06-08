@@ -855,6 +855,9 @@ class ProbeEddy:
         gcmd.respond_info(
             f"Last coil value: {freq:.2f} ({height:.3f}mm) raw: {hex(freqval)} {err}status: {hex(status)} {self._sensor.status_to_str(status)}"
         )
+        gcmd.respond_info(
+            f"Active drive currents: homing={self._reg_drive_current}, tap={self._tap_drive_current}"
+        )
 
     cmd_PROBE_ACCURACY_help = "Probe accuracy"
 
