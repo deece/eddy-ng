@@ -1667,8 +1667,19 @@ class ProbeEddy:
         # If we're below, move up a bit beyond and the back down
         # to compensate for backlash
         if th_pos[2] < start_z:
-            self._log_debug(f"probe_to_start_position: moving toolhead from {th_pos[2]:.3f} to {(start_z + 1.0):.3f}")
-            th_pos[2] = start_z + 1.0
+            max_z = start_z + 1.0
+            # limit backlash overshoot to not exceed sensor's calibrated height range if calibrated
+            dc = self.current_drive_current()
+            if self.calibrated(dc):
+                fmap = self.map_for_drive_current(dc)
+                if fmap.height_range[1] > start_z:
+                    # leave a small buffer of 0.05mm below the absolute limit to be safe
+                    max_z = min(max_z, fmap.height_range[1] - 0.05)
+                    # make sure max_z is still above start_z so we do some overshoot
+                    if max_z <= start_z:
+                        max_z = start_z
+            self._log_debug(f"probe_to_start_position: moving toolhead from {th_pos[2]:.3f} to {max_z:.3f}")
+            th_pos[2] = max_z
             th.manual_move(th_pos, self.params.lift_speed)
 
         self._log_debug(f"probe_to_start_position: moving toolhead from {th_pos[2]:.3f} to {start_z:.3f}")
