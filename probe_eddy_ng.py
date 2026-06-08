@@ -1073,11 +1073,36 @@ class ProbeEddy:
         finally:
             self._sensor.set_drive_current(old_drive_current)
 
-    cmd_SETUP_help = "Setup"
+    cmd_SETUP_help = (
+        "Setup the eddy current sensor. Specify NOHOME=1 to suppress homing X & Y and "
+        "centering before setup."
+    )
 
     def cmd_SETUP(self, gcmd: GCodeCommand):
-        if not self._xy_homed():
-            raise self._printer.command_error("X and Y must be homed before setup")
+        nohome = gcmd.get_int("NOHOME", 0) != 0
+        if not nohome:
+            if self._z_homed():
+                self._z_hop()
+            self._gcode.run_script_from_command("G28 X Y")
+
+            th = self._printer.lookup_object("toolhead")
+            center_x = 60.0
+            center_y = 60.0
+            try:
+                kin = th.get_kinematics()
+                rails = kin.rails
+                x_min, x_max = rails[0].get_range()
+                y_min, y_max = rails[1].get_range()
+                center_x = (x_min + x_max) / 2.0
+                center_y = (y_min + y_max) / 2.0
+            except Exception:
+                pass
+            self._log_msg(f"Moving toolhead to center: X={center_x:.1f}, Y={center_y:.1f}")
+            th.manual_move([center_x, center_y, None], self.params.move_speed)
+            th.wait_moves()
+        else:
+            if not self._xy_homed():
+                raise self._printer.command_error("X and Y must be homed before setup")
 
         if self._z_homed():
             # z-hop so that manual probe helper doesn't complain if we're already
