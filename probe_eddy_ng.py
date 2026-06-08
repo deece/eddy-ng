@@ -1731,6 +1731,7 @@ class ProbeEddy:
         tap_speed: float,
         lift_speed: float,
         tapcfg: ProbeEddy.TapConfig,
+        drive_current: Optional[int] = None,
     ) -> TapResult:
         self.probe_to_start_position(start_z)
 
@@ -1740,8 +1741,14 @@ class ProbeEddy:
         target_position[2] = target_z
 
         error = None
+        orig_dc = self.current_drive_current()
 
         try:
+            if drive_current is not None:
+                self._sensor.set_drive_current(drive_current)
+                th.dwell(0.050)
+                th.wait_moves()
+
             # configure the endstop for tap (gets reset at the end of a tap sequence,
             # also in finally just in case
             self._endstop_wrapper.tap_config = tapcfg
@@ -1803,6 +1810,9 @@ class ProbeEddy:
                     raise
         finally:
             self._endstop_wrapper.tap_config = None
+            if drive_current is not None:
+                self._sensor.set_drive_current(orig_dc)
+                th.wait_moves()
 
         # The toolhead ended at finish_z, but probe_z is the actual zero.
         # finish_z should be below or equal to probe_z because there will always be
@@ -1939,63 +1949,59 @@ class ProbeEddy:
         sample_err_count = 0
         tap = None
 
-        try:
-            self._sensor.set_drive_current(tap_drive_current)
+        sample_last_err = None
 
-            sample_last_err = None
+        for sample_i in range(max_samples):
+            if self.params.debug:
+                self.save_samples_path = f"/tmp/tap-samples-{sample_i+1}.csv"
 
-            for sample_i in range(max_samples):
-                if self.params.debug:
-                    self.save_samples_path = f"/tmp/tap-samples-{sample_i+1}.csv"
+            tap = self.do_one_tap(
+                start_z=tap_start_z,
+                target_z=target_z,
+                tap_speed=tap_speed,
+                lift_speed=lift_speed,
+                tapcfg=tapcfg,
+                drive_current=tap_drive_current,
+            )
 
-                tap = self.do_one_tap(
-                    start_z=tap_start_z,
-                    target_z=target_z,
-                    tap_speed=tap_speed,
-                    lift_speed=lift_speed,
-                    tapcfg=tapcfg,
-                )
-
-                if write_every_tap_plot:
-                    try:
-                        self._write_tap_plot(tap, sample_i)
-                    except Exception as e:
-                        self._log_error(f"Failed to write tap plot: {e}")
-
-                if tap.error:
-                    if "too close to target z" in str(tap.error):
-                        self._log_msg(f"Tap {sample_i+1}: failed: try lowering TARGET_Z by 0.100 (to {target_z - 0.100:.3f})")
-                    else:
-                        self._log_msg(f"Tap {sample_i+1}: failed ({tap.error})")
-                    sample_err_count += 1
-                    sample_last_err = tap
-                    continue
-
-                results.append(tap)
-
-                self._log_msg(f"Tap {sample_i+1}: z={tap.probe_z:.3f}")
-                self._log_debug(
-                    f"tap[{sample_i+1}]: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} overshoot: {tap.overshoot:.3f} at {tap.tap_time:.4f}s"
-                )
-
-                if samples == 1:
-                    # only one sample, we're done
-                    tap_z = tap.probe_z
-                    tap_stddev = 0.0
-                    tap_overshoot = tap.overshoot
-                    break
-
-                if len(results) >= samples:
-                    tap_z, tap_stddev, tap_overshoot = self._compute_tap_z(results, samples, samples_stddev, use_median)
-                    if tap_z is not None:
-                        break
-        finally:
-            self.reset_drive_current()
-            if write_tap_plot and not write_every_tap_plot and tap:
+            if write_every_tap_plot:
                 try:
-                    self._write_tap_plot(tap)
+                    self._write_tap_plot(tap, sample_i)
                 except Exception as e:
                     self._log_error(f"Failed to write tap plot: {e}")
+
+            if tap.error:
+                if "too close to target z" in str(tap.error):
+                    self._log_msg(f"Tap {sample_i+1}: failed: try lowering TARGET_Z by 0.100 (to {target_z - 0.100:.3f})")
+                else:
+                    self._log_msg(f"Tap {sample_i+1}: failed ({tap.error})")
+                sample_err_count += 1
+                sample_last_err = tap
+                continue
+
+            results.append(tap)
+
+            self._log_msg(f"Tap {sample_i+1}: z={tap.probe_z:.3f}")
+            self._log_debug(
+                f"tap[{sample_i+1}]: {tap.probe_z:.3f} toolhead at: {tap.toolhead_z:.3f} overshoot: {tap.overshoot:.3f} at {tap.tap_time:.4f}s"
+            )
+
+            if samples == 1:
+                # only one sample, we're done
+                tap_z = tap.probe_z
+                tap_stddev = 0.0
+                tap_overshoot = tap.overshoot
+                break
+
+            if len(results) >= samples:
+                tap_z, tap_stddev, tap_overshoot = self._compute_tap_z(results, samples, samples_stddev, use_median)
+                if tap_z is not None:
+                    break
+        if write_tap_plot and not write_every_tap_plot and tap:
+            try:
+                self._write_tap_plot(tap)
+            except Exception as e:
+                self._log_error(f"Failed to write tap plot: {e}")
 
         th = self._toolhead
 
