@@ -784,6 +784,8 @@ class ProbeEddy:
         if self.params.tap_drive_current != self._tap_drive_current or self.params.tap_drive_current == self._saved_tap_drive_current:
             configfile.set(self._full_name, "tap_drive_current", str(self._tap_drive_current))
 
+        configfile.set(self._full_name, "tap_start_z", f"{self.params.tap_start_z:.2f}")
+
         for _, fmap in self._dc_to_fmap.items():
             fmap.save_calibration()
 
