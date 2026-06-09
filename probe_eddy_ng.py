@@ -839,7 +839,7 @@ class ProbeEddy:
                         t_high, map_high = mappings[j+1]
                         f_low = map_low.height_to_freq(height)
                         f_high = map_high.height_to_freq(height)
-                        fraction = (temp - t_low) / (t_high - t_low)
+                        fraction = (temp - t_low) / (t_high - t_low) if t_high != t_low else 0.0
                         return f_low + fraction * (f_high - f_low)
         return self.map_for_drive_current(drive_current).height_to_freq(height)
 
@@ -871,7 +871,7 @@ class ProbeEddy:
                         t_high, map_high = mappings[j+1]
                         h_low = map_low.freq_to_height(freq)
                         h_high = map_high.freq_to_height(freq)
-                        fraction = (temp - t_low) / (t_high - t_low)
+                        fraction = (temp - t_low) / (t_high - t_low) if t_high != t_low else 0.0
                         return h_low + fraction * (h_high - h_low)
 
         return self.map_for_drive_current(drive_current).freq_to_height(freq)
@@ -904,7 +904,7 @@ class ProbeEddy:
                         t_high, map_high = mappings[j+1]
                         h_low = map_low.freqs_to_heights_np(freqs)
                         h_high = map_high.freqs_to_heights_np(freqs)
-                        fraction = (temp - t_low) / (t_high - t_low)
+                        fraction = (temp - t_low) / (t_high - t_low) if t_high != t_low else 0.0
                         return h_low + fraction * (h_high - h_low)
 
         return self.map_for_drive_current(drive_current).freqs_to_heights_np(freqs)
