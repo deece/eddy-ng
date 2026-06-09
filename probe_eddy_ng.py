@@ -269,6 +269,7 @@ class ProbeEddyParams:
     debug: bool = True
 
     tap_trigger_safe_start_height: float = 1.5
+    sensor_temp_sensor: Optional[str] = None
 
     _warning_msgs: List[str] = field(default_factory=list)
 
@@ -348,6 +349,7 @@ class ProbeEddyParams:
 
         self.x_offset = config.getfloat("x_offset", self.x_offset)
         self.y_offset = config.getfloat("y_offset", self.y_offset)
+        self.sensor_temp_sensor = config.get("sensor_temp_sensor", self.sensor_temp_sensor)
 
         self.validate(config)
 
@@ -490,16 +492,68 @@ class ProbeEddy:
         calibrated_drive_currents = config.getintlist("calibrated_drive_currents", [])
 
         self._dc_to_fmap: Dict[int, ProbeEddyFrequencyMap] = {}
-        if not calibration_bad:
-            for dc in calibrated_drive_currents:
-                fmap = ProbeEddyFrequencyMap(self)
-                if fmap.load_from_config(config, dc):
-                    self._dc_to_fmap[dc] = fmap
-        else:
-            for dc in calibrated_drive_currents:
-                # read so that there are no warnings about unknown fields
-                _ = config.get(f"calibration_{dc}")
-            self.params._warning_msgs.append("EDDYng calibration: calibration data invalid, please recalibrate")
+        self._dc_to_temp_fmaps: Dict[int, List[Tuple[float, ProbeEddyFrequencyMap]]] = {}
+        self._dc_to_drift_coefs: Dict[int, Tuple[float, float, float, float]] = {}
+
+        # 1. Load baseline and Z-drift coefficients from config
+        for dc in calibrated_drive_currents:
+            baseline_str = config.get(f"calibration_3d_baseline_{dc}", None)
+            htof_str = config.get(f"calibration_3d_htof_{dc}", None)
+            drift_str = config.get(f"calibration_3d_drift_{dc}", None)
+
+            if baseline_str is not None and htof_str is not None:
+                try:
+                    b_parts = [float(v) for v in baseline_str.split(",")]
+                    h_parts = [float(v) for v in htof_str.split(",")]
+                    if len(b_parts) == 9 and len(h_parts) == 10:
+                        p_inf, c0, c1, c2, c3, hmin, hmax, fmin, fmax = b_parts
+
+                        fmap = ProbeEddyFrequencyMap(self)
+                        fmap.drive_current = dc
+                        fmap.height_range = [hmin, hmax]
+                        fmap.freq_range = [fmin, fmax]
+
+                        # Reconstruct ftoh (rational fit)
+                        fmap._ftoh = ProbeEddyRationalFit(p_inf, [c0, c1, c2, c3], [1.0/fmax, 1.0/fmin])
+                        # Reconstruct htof (polynomial fit)
+                        fmap._htof = npp.Polynomial(h_parts, domain=[hmin, hmax])
+
+                        self._dc_to_fmap[dc] = fmap
+                        logging.info(f"EDDYng: Loaded reconstructed 3D baseline mapping for drive current {dc}")
+                except Exception as e:
+                    logging.exception(f"EDDYng: Failed to load 3D baseline for drive current {dc}")
+                    self.params._warning_msgs.append(f"EDDYng 3D baseline: load failed for DC {dc} ({e})")
+
+            if drift_str is not None:
+                try:
+                    d_parts = [float(v) for v in drift_str.split(",")]
+                    if len(d_parts) == 4:
+                        ref_temp, drift_c3, drift_c2, drift_c1 = d_parts
+                        self._dc_to_drift_coefs[dc] = (ref_temp, drift_c3, drift_c2, drift_c1)
+                        logging.info(f"EDDYng: Loaded 3D Z-drift coefficients for drive current {dc}")
+                except Exception as e:
+                    logging.exception(f"EDDYng: Failed to load 3D drift for drive current {dc}")
+                    self.params._warning_msgs.append(f"EDDYng 3D Z-drift: load failed for DC {dc} ({e})")
+
+        # Fall back to 2D calibration loading if 3D is not populated
+        if not self._dc_to_fmap and not self._dc_to_drift_coefs:
+            if not calibration_bad:
+                loaded_2d = False
+                for dc in calibrated_drive_currents:
+                    fmap = ProbeEddyFrequencyMap(self)
+                    if fmap.load_from_config(config, dc):
+                        self._dc_to_fmap[dc] = fmap
+                        loaded_2d = True
+                if loaded_2d:
+                    self.params._warning_msgs.append(
+                        "EDDYng: Using legacy 2D Z-calibration. 3D Z-drift temperature "
+                        "calibration is missing. We recommend running PROBE_EDDY_NG_SETUP."
+                    )
+            else:
+                for dc in calibrated_drive_currents:
+                    # read so that there are no warnings about unknown fields
+                    _ = config.get(f"calibration_{dc}")
+                self.params._warning_msgs.append("EDDYng calibration: calibration data invalid, please recalibrate")
 
         # Our virtual endstop wrapper -- used for homing.
         self._endstop_wrapper = ProbeEddyEndstopWrapper(self)
@@ -564,6 +618,25 @@ class ProbeEddy:
     def _log_debug(self, msg):
         if self.params.debug:
             logging.info(f"{self._name}: {msg}")
+
+    def _log_calibration_sweep_data(self, temp: float, dc: int, mapping: ProbeEddyFrequencyMap):
+        if mapping is None:
+            return
+        ftoh_coefs = mapping._ftoh.coef.tolist() if mapping._ftoh else None
+        htof_coefs = mapping._htof.coef.tolist() if mapping._htof else None
+        self._log_msg(
+            f"3D Sweep Log: temp={temp:.2f}C, dc={dc}, "
+            f"ftoh_coefs={ftoh_coefs}, htof_coefs={htof_coefs}"
+        )
+        grid_data = []
+        for h in [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0]:
+            if mapping.height_range[0] <= h <= mapping.height_range[1]:
+                try:
+                    f = mapping.height_to_freq(h)
+                    grid_data.append(f"{h:.1f}mm:{f:.1f}Hz")
+                except Exception:
+                    pass
+        self._log_msg(f"3D Sweep Grid: temp={temp:.2f}C, dc={dc} | " + ", ".join(grid_data))
 
     def define_commands(self, gcode):
         gcode.register_command("PROBE_EDDY_NG_STATUS", self.cmd_STATUS, self.cmd_STATUS_help)
@@ -657,6 +730,11 @@ class ProbeEddy:
     def _handle_connect(self):
         self._toolhead = self._printer.lookup_object("toolhead")
         self._trapq = self._toolhead.get_trapq()
+        self._temp_sensor_obj = None
+        if self.params.sensor_temp_sensor:
+            self._temp_sensor_obj = self._printer.lookup_object(self.params.sensor_temp_sensor, None)
+            if self._temp_sensor_obj is None:
+                self._log_warning(f"Configured sensor_temp_sensor '{self.params.sensor_temp_sensor}' not found")
         for msg in self.params._warning_msgs:
             self._log_warning(msg)
 
@@ -724,23 +802,118 @@ class ProbeEddy:
         if dc is None:
             dc = self.current_drive_current()
         if dc not in self._dc_to_fmap:
+            if dc in self._dc_to_temp_fmaps and self._dc_to_temp_fmaps[dc]:
+                # Fallback to the first temp calibration map if 3D is active but 2D map is requested
+                return self._dc_to_temp_fmaps[dc][0][1]
             raise self._printer.command_error(f"Drive current {dc} not calibrated")
         return self._dc_to_fmap[dc]
 
-    # helpers to forward to the map
+    def get_sensor_temp(self) -> Optional[float]:
+        if getattr(self, "_temp_sensor_obj", None) is None:
+            return None
+        try:
+            curtime = self._reactor.monotonic()
+            status = self._temp_sensor_obj.get_status(curtime)
+            return status.get("temperature")
+        except Exception:
+            return None
+
+    # helpers to forward to the map, with optional 3D calibration support
     def height_to_freq(self, height: float, drive_current: Optional[int] = None) -> float:
         if drive_current is None:
             drive_current = self.current_drive_current()
+        temp = self.get_sensor_temp()
+        if temp is not None and drive_current in self._dc_to_temp_fmaps and self._dc_to_temp_fmaps[drive_current]:
+            mappings = self._dc_to_temp_fmaps[drive_current]
+            if len(mappings) == 1:
+                return mappings[0][1].height_to_freq(height)
+            temps = [m[0] for m in mappings]
+            if temp <= temps[0]:
+                return mappings[0][1].height_to_freq(height)
+            elif temp >= temps[-1]:
+                return mappings[-1][1].height_to_freq(height)
+            else:
+                for j in range(len(temps) - 1):
+                    if temps[j] <= temp <= temps[j+1]:
+                        t_low, map_low = mappings[j]
+                        t_high, map_high = mappings[j+1]
+                        f_low = map_low.height_to_freq(height)
+                        f_high = map_high.height_to_freq(height)
+                        fraction = (temp - t_low) / (t_high - t_low)
+                        return f_low + fraction * (f_high - f_low)
         return self.map_for_drive_current(drive_current).height_to_freq(height)
 
     def freq_to_height(self, freq: float, drive_current: Optional[int] = None) -> float:
         if drive_current is None:
             drive_current = self.current_drive_current()
+
+        temp = self.get_sensor_temp()
+        if temp is not None and drive_current in self._dc_to_drift_coefs:
+            h_baseline = self.map_for_drive_current(drive_current).freq_to_height(freq)
+            ref_temp, c3, c2, c1 = self._dc_to_drift_coefs[drive_current]
+            dT = temp - ref_temp
+            delta_h = c3*(dT**3) + c2*(dT**2) + c1*dT
+            return h_baseline - delta_h
+
+        if temp is not None and drive_current in self._dc_to_temp_fmaps and self._dc_to_temp_fmaps[drive_current]:
+            mappings = self._dc_to_temp_fmaps[drive_current]
+            if len(mappings) == 1:
+                return mappings[0][1].freq_to_height(freq)
+            temps = [m[0] for m in mappings]
+            if temp <= temps[0]:
+                return mappings[0][1].freq_to_height(freq)
+            elif temp >= temps[-1]:
+                return mappings[-1][1].freq_to_height(freq)
+            else:
+                for j in range(len(temps) - 1):
+                    if temps[j] <= temp <= temps[j+1]:
+                        t_low, map_low = mappings[j]
+                        t_high, map_high = mappings[j+1]
+                        h_low = map_low.freq_to_height(freq)
+                        h_high = map_high.freq_to_height(freq)
+                        fraction = (temp - t_low) / (t_high - t_low)
+                        return h_low + fraction * (h_high - h_low)
+
         return self.map_for_drive_current(drive_current).freq_to_height(freq)
+
+    def freqs_to_heights_np(self, freqs: np.array, drive_current: Optional[int] = None) -> np.array:
+        if drive_current is None:
+            drive_current = self.current_drive_current()
+
+        temp = self.get_sensor_temp()
+        if temp is not None and drive_current in self._dc_to_drift_coefs:
+            h_baseline = self.map_for_drive_current(drive_current).freqs_to_heights_np(freqs)
+            ref_temp, c3, c2, c1 = self._dc_to_drift_coefs[drive_current]
+            dT = temp - ref_temp
+            delta_h = c3*(dT**3) + c2*(dT**2) + c1*dT
+            return h_baseline - delta_h
+
+        if temp is not None and drive_current in self._dc_to_temp_fmaps and self._dc_to_temp_fmaps[drive_current]:
+            mappings = self._dc_to_temp_fmaps[drive_current]
+            if len(mappings) == 1:
+                return mappings[0][1].freqs_to_heights_np(freqs)
+            temps = [m[0] for m in mappings]
+            if temp <= temps[0]:
+                return mappings[0][1].freqs_to_heights_np(freqs)
+            elif temp >= temps[-1]:
+                return mappings[-1][1].freqs_to_heights_np(freqs)
+            else:
+                for j in range(len(temps) - 1):
+                    if temps[j] <= temp <= temps[j+1]:
+                        t_low, map_low = mappings[j]
+                        t_high, map_high = mappings[j+1]
+                        h_low = map_low.freqs_to_heights_np(freqs)
+                        h_high = map_high.freqs_to_heights_np(freqs)
+                        fraction = (temp - t_low) / (t_high - t_low)
+                        return h_low + fraction * (h_high - h_low)
+
+        return self.map_for_drive_current(drive_current).freqs_to_heights_np(freqs)
 
     def calibrated(self, drive_current: Optional[int] = None) -> bool:
         if drive_current is None:
             drive_current = self.current_drive_current()
+        if drive_current in self._dc_to_temp_fmaps and self._dc_to_temp_fmaps[drive_current]:
+            return all(m[1].calibrated() for m in self._dc_to_temp_fmaps[drive_current])
         return drive_current in self._dc_to_fmap and self._dc_to_fmap[drive_current].calibrated()
 
     def _print_time_now(self):
@@ -791,15 +964,80 @@ class ProbeEddy:
                     "clear_homing_state failed: please update Klipper, your klipper is from the brief 5 day window where this was broken"
                 )
 
-    def save_config(self):
+    def save_calibration_3d(self):
+        configfile = self._printer.lookup_object("configfile")
+
+        # 1. Save raw sweep data to a CSV file for the user
+        if self._dc_to_temp_fmaps:
+            csv_filepath = os.path.expanduser("~/printer_data/config/eddy_calibration_3d.csv")
+            try:
+                with open(csv_filepath, "w") as f:
+                    f.write("temperature,drive_current,time,frequency,height,velocity\n")
+                    for dc, mappings_list in self._dc_to_temp_fmaps.items():
+                        for temp, fmap in mappings_list:
+                            if hasattr(fmap, "raw_data") and fmap.raw_data is not None:
+                                times, freqs, heights, vels = fmap.raw_data
+                                for i in range(len(freqs)):
+                                    t = times[i]
+                                    freq = freqs[i]
+                                    h = heights[i]
+                                    v = vels[i] if vels is not None else 0.0
+                                    f.write(f"{temp:.4f},{dc},{t:.6f},{freq:.2f},{h:.6f},{v:.6f}\n")
+                self._log_msg(f"Raw 3D calibration sweep data saved to CSV: {csv_filepath}")
+            except Exception as e:
+                self._log_error(f"Failed to save raw 3D calibration sweep data to CSV: {e}")
+
+        # 2. Save coefficients to configuration file
+        dcs = self._dc_to_temp_fmaps.keys() if self._dc_to_temp_fmaps else self._dc_to_drift_coefs.keys()
+        for dc in dcs:
+            if self._dc_to_temp_fmaps:
+                baseline_temp, baseline_map = self._dc_to_temp_fmaps[dc][0]
+            else:
+                baseline_map = self._dc_to_fmap[dc]
+
+            p_inf = baseline_map._ftoh.p_inf
+            c0, c1, c2, c3 = baseline_map._ftoh.coef
+            hmin, hmax = baseline_map.height_range
+            fmin, fmax = baseline_map.freq_range
+            configfile.set(
+                self._full_name,
+                f"calibration_3d_baseline_{dc}",
+                f"{p_inf:.12e},{c0:.12e},{c1:.12e},{c2:.12e},{c3:.12e},{hmin:.4f},{hmax:.4f},{fmin:.2f},{fmax:.2f}"
+            )
+
+            htof_coefs = baseline_map._htof.coef.tolist()
+            htof_str = ",".join([f"{c:.12e}" for c in htof_coefs])
+            configfile.set(
+                self._full_name,
+                f"calibration_3d_htof_{dc}",
+                htof_str
+            )
+
+            if dc in self._dc_to_drift_coefs:
+                ref_temp, drift_c3, drift_c2, drift_c1 = self._dc_to_drift_coefs[dc]
+                configfile.set(
+                    self._full_name,
+                    f"calibration_3d_drift_{dc}",
+                    f"{ref_temp:.4f},{drift_c3:.12e},{drift_c2:.12e},{drift_c1:.12e}"
+                )
+
+    def save_config(self, log_msg=True):
         configfile = self._printer.lookup_object("configfile")
         configfile.remove_section(self._full_name)
 
-        configfile.set(
-            self._full_name,
-            "calibrated_drive_currents",
-            str.join(", ", [str(dc) for dc in self._dc_to_fmap.keys()]),
-        )
+        if self._dc_to_temp_fmaps:
+            configfile.set(
+                self._full_name,
+                "calibrated_drive_currents",
+                str.join(", ", [str(dc) for dc in self._dc_to_temp_fmaps.keys()]),
+            )
+        else:
+            configfile.set(
+                self._full_name,
+                "calibrated_drive_currents",
+                str.join(", ", [str(dc) for dc in self._dc_to_fmap.keys()]),
+            )
+
         configfile.set(
             self._full_name,
             "calibration_version",
@@ -814,10 +1052,14 @@ class ProbeEddy:
 
         configfile.set(self._full_name, "tap_start_z", f"{self.params.tap_start_z:.2f}")
 
-        for _, fmap in self._dc_to_fmap.items():
-            fmap.save_calibration()
+        if self._dc_to_temp_fmaps or self._dc_to_drift_coefs:
+            self.save_calibration_3d()
+        else:
+            for _, fmap in self._dc_to_fmap.items():
+                fmap.save_calibration()
 
-        self._log_msg("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
+        if log_msg:
+            self._log_msg("Calibration saved. Issue a SAVE_CONFIG to write the values to your config file and restart Klipper.")
 
     def start_sampler(self, *args, **kwargs) -> ProbeEddySampler:
         if self._sampler:
@@ -883,8 +1125,11 @@ class ProbeEddy:
         gcmd.respond_info(
             f"Last coil value: {freq:.2f} ({height:.3f}mm) raw: {hex(freqval)} {err}status: {hex(status)} {self._sensor.status_to_str(status)}"
         )
+        temp = self.get_sensor_temp()
+        using_3d = self.current_drive_current() in self._dc_to_temp_fmaps and self._dc_to_temp_fmaps[self.current_drive_current()]
+        temp_str = f"temp={temp:.1f}C (3D cal)" if (temp is not None and using_3d) else (f"temp={temp:.1f}C (no 3D cal)" if temp is not None else "temp=N/A")
         gcmd.respond_info(
-            f"Active drive currents: homing={self._reg_drive_current}, tap={self._tap_drive_current}"
+            f"Active drive currents: homing={self._reg_drive_current}, tap={self._tap_drive_current} | {temp_str}"
         )
 
     cmd_PROBE_ACCURACY_help = "Probe accuracy"
@@ -1141,9 +1386,18 @@ class ProbeEddy:
                 )
             target_temp = filament_temps[filament]
 
-        if target_temp > 0.0:
-            self._log_msg(f"Preheating bed to target temperature {target_temp:.1f}C for calibration...")
-            self._gcode.run_script_from_command(f"M190 S{target_temp:.0f}")
+        self._setup_target_temp = target_temp
+
+        if self._temp_sensor_obj is not None:
+            self._log_msg(
+                f"3D calibration enabled with temperature sensor '{self.params.sensor_temp_sensor}'. "
+                f"Manual Z alignment will be performed at room temperature, then calibration will run "
+                f"while heating up to {target_temp:.1f}C."
+            )
+        else:
+            if target_temp > 0.0:
+                self._log_msg(f"Preheating bed to target temperature {target_temp:.1f}C for calibration...")
+                self._gcode.run_script_from_command(f"M190 S{target_temp:.0f}")
 
         nohome = gcmd.get_int("NOHOME", 0) != 0
         if not nohome:
@@ -1284,26 +1538,163 @@ class ProbeEddy:
             self._z_not_homed()
             return
 
-        # 3. Calibrate all valid drive currents
+        # 3. Calibrate all valid drive currents (with temperature loop if 3D calibration is active)
+        self._dc_to_temp_fmaps = {}
         calibrated_mappings = {}
-        for dc in valid_currents:
-            self._log_msg(f"Calibrating drive current {dc}...")
-            mapping, fth_fit, htf_fit = self._create_mapping(
-                cal_z_max,
-                z_target,
-                self.params.probe_speed,
-                self.params.lift_speed,
-                dc,
-                report_errors=False,
-                write_debug_files=debug,
-            )
-            if mapping is None or fth_fit is None or htf_fit is None:
-                self._log_msg(f"  Drive current {dc}: Calibration failed to fit mapping")
-                continue
 
-            calibrated_mappings[dc] = (mapping, fth_fit)
-            self._dc_to_fmap[dc] = mapping
-            self._log_msg(f"  Drive current {dc}: Calibrated successfully")
+        if self._temp_sensor_obj is not None:
+            calibrated_temp_mappings = {dc: [] for dc in valid_currents}
+            room_temp = self.get_sensor_temp() or 0.0
+            last_sweep_temp = room_temp
+
+            self._log_msg(f"Running baseline room temperature calibration sweep at {room_temp:.1f}C...")
+            for dc in valid_currents:
+                self._log_msg(f"Calibrating drive current {dc} at {room_temp:.1f}C...")
+                mapping, fth_fit, htf_fit = self._create_mapping(
+                    cal_z_max,
+                    z_target,
+                    self.params.probe_speed,
+                    self.params.lift_speed,
+                    dc,
+                    report_errors=False,
+                    write_debug_files=debug,
+                )
+                if mapping is not None:
+                    calibrated_temp_mappings[dc].append((room_temp, mapping, fth_fit))
+                    self._log_msg(f"  Drive current {dc}: Calibrated successfully at room temperature")
+                    self._log_calibration_sweep_data(room_temp, dc, mapping)
+
+            # Raise toolhead high for safety between sweeps
+            th.manual_move([None, None, cal_z_max + 3.0], self.params.lift_speed)
+            th.wait_moves()
+
+            # Round up to next multiple of 5 above room temp (toolhead sensor temp)
+            start_target = math.ceil(room_temp / 5.0) * 5.0
+            if start_target <= room_temp:
+                start_target += 5.0
+
+            targets = []
+            t = start_target
+            while t < self._setup_target_temp:
+                targets.append(t)
+                t += 5.0
+            targets.append(self._setup_target_temp)
+
+            self._log_msg(f"Generated step-by-step target bed temperatures: {targets}")
+
+            for t in targets:
+                self._log_msg(f"Heating bed to step target {t:.1f}C...")
+                self._gcode.run_script_from_command(f"M190 S{t:.0f}")
+
+                current_temp = self.get_sensor_temp() or 0.0
+                self._log_msg(
+                    f"Bed reached target {t:.1f}C. "
+                    f"Sensor temperature is {current_temp:.1f}C. "
+                    f"Running sweep for valid drive currents..."
+                )
+
+                for dc in valid_currents:
+                    self._log_msg(f"Calibrating drive current {dc} at {current_temp:.1f}C...")
+                    mapping, fth_fit, htf_fit = self._create_mapping(
+                        cal_z_max,
+                        z_target,
+                        self.params.probe_speed,
+                        self.params.lift_speed,
+                        dc,
+                        report_errors=False,
+                        write_debug_files=debug,
+                    )
+                    if mapping is not None:
+                        calibrated_temp_mappings[dc].append((current_temp, mapping, fth_fit))
+                        self._log_calibration_sweep_data(current_temp, dc, mapping)
+
+            # Build self._dc_to_temp_fmaps and evaluate final sweep
+            for dc in valid_currents:
+                if calibrated_temp_mappings[dc]:
+                    self._dc_to_temp_fmaps[dc] = []
+                    for temp, mapping, _ in calibrated_temp_mappings[dc]:
+                        self._dc_to_temp_fmaps[dc].append((temp, mapping))
+                    self._dc_to_temp_fmaps[dc].sort(key=lambda x: x[0])
+
+                    # Calculate and log cubic Z-drift coefficients
+                    try:
+                        sweeps = calibrated_temp_mappings[dc][:]
+                        # Sort sweeps by temperature
+                        sweeps.sort(key=lambda x: x[0])
+                        baseline_temp, baseline_map, _ = sweeps[0]
+
+                        # Find safe height range intersection (limiting htof evaluation range up to 5.0mm)
+                        common_min = max(item[1].height_range[0] for item in sweeps)
+                        common_max = min(item[1].height_range[1] for item in sweeps)
+                        common_max = min(5.0, common_max)
+
+                        if common_min < common_max:
+                            height_grid = np.linspace(common_min, common_max, 100)
+                            delta_h_vals = []
+                            delta_T_vals = []
+
+                            for temp, mapping, _ in sweeps:
+                                delta_T = temp - baseline_temp
+                                delta_T_vals.append(delta_T)
+
+                                if delta_T == 0.0:
+                                    delta_h_vals.append(0.0)
+                                    continue
+
+                                # Evaluate periods and frequencies
+                                freqs = []
+                                for h in height_grid:
+                                    p = mapping._htof(h)
+                                    freqs.append(1.0 / p)
+
+                                # Predict heights using baseline ftoh
+                                h_preds = []
+                                for f in freqs:
+                                    h_preds.append(baseline_map._ftoh(1.0 / f))
+
+                                delta_h = np.mean(np.array(h_preds) - height_grid)
+                                delta_h_vals.append(delta_h)
+
+                            delta_T_vals = np.array(delta_T_vals)
+                            delta_h_vals = np.array(delta_h_vals)
+
+                            # Solve least squares for cubic with zero-intercept
+                            A = np.column_stack((delta_T_vals**3, delta_T_vals**2, delta_T_vals))
+                            c3, c2, c1 = np.linalg.lstsq(A, delta_h_vals, rcond=None)[0]
+                            self._dc_to_drift_coefs[dc] = (baseline_temp, c3, c2, c1)
+
+                            self._log_msg(
+                                f"Thermal Z-drift cubic coefficients for DC {dc} (ref {baseline_temp:.2f}C):\n"
+                                f"  c3 = {c3:.4e}, c2 = {c2:.4e}, c1 = {c1:.4e}\n"
+                                f"  Formula: delta_h(dT) = c3*dT^3 + c2*dT^2 + c1*dT (in mm)"
+                            )
+                    except Exception as e:
+                        logging.warning(f"Could not calculate cubic Z-drift coefficients for DC {dc}: {e}")
+
+                    # Select optimal homing/tap evaluation mapping from final sweep
+                    final_sweep = calibrated_temp_mappings[dc][-1]
+                    calibrated_mappings[dc] = (final_sweep[1], final_sweep[2])
+
+        else:
+            # Fallback to standard 2D calibration at target temperature
+            for dc in valid_currents:
+                self._log_msg(f"Calibrating drive current {dc}...")
+                mapping, fth_fit, htf_fit = self._create_mapping(
+                    cal_z_max,
+                    z_target,
+                    self.params.probe_speed,
+                    self.params.lift_speed,
+                    dc,
+                    report_errors=False,
+                    write_debug_files=debug,
+                )
+                if mapping is None or fth_fit is None or htf_fit is None:
+                    self._log_msg(f"  Drive current {dc}: Calibration failed to fit mapping")
+                    continue
+
+                calibrated_mappings[dc] = (mapping, fth_fit)
+                self._dc_to_fmap[dc] = mapping
+                self._log_msg(f"  Drive current {dc}: Calibrated successfully")
 
         # 4. Select homing and tap drive currents
         homing_req_min = 0.5
@@ -1463,7 +1854,7 @@ class ProbeEddy:
             self._log_warning("Could not find any drive current suitable for tap.")
 
         if calibrated_mappings:
-            self.save_config()
+            self.save_config(log_msg=False)
 
             # Show summary of all the ranges at each drive strength, and the selected drive strength for homing, and tap
             self._log_msg("\n================== EDDY-ng Calibration Summary ==================")
@@ -1489,11 +1880,16 @@ class ProbeEddy:
         self._z_not_homed()
 
     cmd_CALIBRATE_help = (
-        "Calibrate the eddy current sensor. Specify DRIVE_CURRENT to calibrate for a different drive current "
-        + "than the default. Specify START_Z to set a different calibration start point."
+        "Calibrate the eddy current sensor. Requires TEMPERATURE to specify the calibration temperature. "
+        + "Specify DRIVE_CURRENT to calibrate for a different drive current than the default. "
+        + "Specify START_Z to set a different calibration start point."
     )
 
     def cmd_CALIBRATE(self, gcmd: GCodeCommand):
+        temp = gcmd.get_float("TEMPERATURE", None)
+        if temp is None:
+            raise gcmd.error("TEMPERATURE parameter is required for PROBE_EDDY_NG_CALIBRATE")
+
         if not self._xy_homed():
             raise self._printer.command_error("X and Y must be homed before calibrating")
 
@@ -1513,10 +1909,10 @@ class ProbeEddy:
         manual_probe.ManualProbeHelper(
             self._printer,
             gcmd,
-            lambda kin_pos: self.cmd_CALIBRATE_next(gcmd, kin_pos),
+            lambda kin_pos: self.cmd_CALIBRATE_next(gcmd, kin_pos, temp),
         )
 
-    def cmd_CALIBRATE_next(self, gcmd: GCodeCommand, kin_pos: Optional[List[float]]):
+    def cmd_CALIBRATE_next(self, gcmd: GCodeCommand, kin_pos: Optional[List[float]], temp: float):
         th = self._printer.lookup_object("toolhead")
         if kin_pos is None:
             # User cancelled ManualProbeHelper
@@ -1567,10 +1963,26 @@ class ProbeEddy:
             self._log_error("Calibration failed")
             return
 
-        self._dc_to_fmap[drive_current] = mapping
+        # Update the specified drive current and temperature in self._dc_to_temp_fmaps
+        if drive_current not in self._dc_to_temp_fmaps:
+            self._dc_to_temp_fmaps[drive_current] = []
+
+        mappings_list = self._dc_to_temp_fmaps[drive_current]
+        replaced = False
+        for i, (t, m) in enumerate(mappings_list):
+            if abs(t - temp) < 0.001:
+                mappings_list[i] = (temp, mapping)
+                replaced = True
+                break
+        if not replaced:
+            mappings_list.append((temp, mapping))
+
+        # Sort mappings list by temperature
+        mappings_list.sort(key=lambda x: x[0])
+
         self.save_config()
 
-        # reset the Z homing state after alibration
+        # reset the Z homing state after calibration
         self._z_not_homed()
 
     def _create_mapping(
@@ -1608,6 +2020,7 @@ class ProbeEddy:
 
         # and build a map
         mapping = ProbeEddyFrequencyMap(self)
+        mapping.raw_data = (times, freqs, heights, vels)
         fth_fit, htf_fit = mapping.calibrate_from_values(
             drive_current,
             times,
@@ -2943,7 +3356,7 @@ class ProbeEddySampler:
         self.freqs.extend(freqs_np.tolist())
 
         if self._fmap is not None:
-            heights_np = self._fmap.freqs_to_heights_np(freqs_np)
+            heights_np = self.eddy.freqs_to_heights_np(freqs_np)
             self.heights.extend(heights_np.tolist())
 
     @property
@@ -3108,6 +3521,33 @@ class ProbeEddySampler:
         return float(median)
 
 
+class ProbeEddyRationalFit:
+    """
+    Fits and represents the Z height mapping as a rational function of period:
+      h(p) = c0 + c1/(p - p_inf) + c2/(p - p_inf)^2 + c3/(p - p_inf)^3
+    where p is in seconds (internally scaled to microseconds for stability).
+    Mimics numpy.polynomial.Polynomial interface for compatibility.
+    """
+    def __init__(self, p_inf, coefs, domain):
+        self.p_inf = p_inf
+        self.coef = np.asarray(coefs)
+        self.domain = np.asarray(domain)
+
+    def __call__(self, p):
+        # Scale to microseconds to keep numerical coefficients stable
+        p_us = p * 1e6
+        p_inf_us = self.p_inf * 1e6
+        diff = p_us - p_inf_us
+        # Guard against division by zero at the pole (diff -> 0)
+        if isinstance(diff, np.ndarray):
+            diff = np.where(np.abs(diff) < 1e-9, -1e-9, diff)
+        else:
+            if abs(diff) < 1e-9:
+                diff = -1e-9
+        x = 1.0 / diff
+        return self.coef[0] + self.coef[1]*x + self.coef[2]*(x**2) + self.coef[3]*(x**3)
+
+
 @final
 class ProbeEddyFrequencyMap:
     calibration_version = 5
@@ -3120,9 +3560,10 @@ class ProbeEddyFrequencyMap:
         self.drive_current = 0
         self.height_range = (math.inf, -math.inf)
         self.freq_range = (math.inf, -math.inf)
-        self._ftoh: Optional[npp.Polynomial] = None
-        self._ftoh_high: Optional[npp.Polynomial] = None
-        self._htof: Optional[npp.Polynomial] = None
+        self._ftoh = None
+        self._ftoh_high = None
+        self._htof = None
+        self.raw_data = None
 
     def _str_to_exact_floatlist(self, str):
         return [float.fromhex(v) for v in str.split(",")]
@@ -3267,7 +3708,33 @@ class ProbeEddyFrequencyMap:
         low_samples = heights <= ProbeEddyFrequencyMap.low_z_threshold
         high_samples = heights >= ProbeEddyFrequencyMap.low_z_threshold - 0.5
 
-        ftoh_low_fn = npp.Polynomial.fit(1.0 / freqs[low_samples], heights[low_samples], deg=9)
+        # Fit 3rd-degree rational model for ftoh_low_fn (height as rational function of period)
+        periods_us = (1.0 / freqs[low_samples]) * 1e6
+        p_max = periods_us.max()
+        # Search space for p_inf (free-space period, larger than maximum active period)
+        p_inf_grid = np.linspace(p_max * 1.001, p_max * 1.5, 1000)
+
+        best_rmse = np.inf
+        best_p_inf = None
+        best_beta = None
+
+        for p_inf_candidate in p_inf_grid:
+            x = 1.0 / (periods_us - p_inf_candidate)
+            M = np.column_stack([np.ones_like(periods_us), x, x**2, x**3])
+            beta, residuals, rank, s = np.linalg.lstsq(M, heights[low_samples], rcond=None)
+            pred = M @ beta
+            rmse = np.sqrt(np.mean((heights[low_samples] - pred)**2))
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_p_inf = p_inf_candidate
+                best_beta = beta
+
+        p_inf_sec = best_p_inf / 1e6
+        ftoh_low_fn = ProbeEddyRationalFit(
+            p_inf_sec,
+            best_beta.tolist(),
+            [periods_us.min() / 1e6, periods_us.max() / 1e6]
+        )
         htof_low_fn = npp.Polynomial.fit(heights[low_samples], 1.0 / freqs[low_samples], deg=9)
 
         if np.count_nonzero(high_samples) > 50:
