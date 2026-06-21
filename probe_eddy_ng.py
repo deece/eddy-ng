@@ -1538,19 +1538,25 @@ class ProbeEddy:
                     if prox_change > 300.0:
                         self._log_msg(f"Proximity detected: change over 4mm {prox_change:.2f} Hz > 300.0 Hz. Switching to fine search at Z={target_z:.2f}")
                         phase = 'fine'
-                        step_size = 0.1
+                        step_size = 0.05
                         speed = 1.0
                         # Clear max_delta and reset previous frequency to current to start fine tracking
                         max_delta = 0.0
                         prev_freq = freq
+                        consecutive_prox = 0
                 else:
                     # Fine phase: track slope and look for contact plateau
                     if delta > max_delta:
                         max_delta = delta
                         max_delta_z = target_z
-                    
-                    if max_delta > 100.0:
-                        if delta < 0.7 * max_delta or delta < 0.15:
+
+                    if max_delta > 120.0:
+                        if delta < 0.6 * max_delta or delta < 0.15:
+                            consecutive_prox += 1
+                        else:
+                            consecutive_prox = 0
+                        
+                        if consecutive_prox >= 2:
                             self._log_msg(f"Eddy auto setup: Bed contact detected at Z={target_z:.2f}. Total change: {total_change:.2f} Hz, Delta: {delta:.2f} Hz (max: {max_delta:.2f} Hz), Freq: {freq:.2f} Hz")
                             contact_detected = True
                             break
@@ -2373,9 +2379,53 @@ class ProbeEddy:
         # This is where the probe thinks we are
         now_height = self._sampler.get_height_now()
 
-        # If we can't get a value at all for right now, for safety, just abort.
+        # If we can't get a value at all for right now, attempt to move closer
         if now_height is None:
-            raise self._printer.command_error("Couldn't get any valid samples from sensor.")
+            self._log_msg("Eddy sensor out of range (bed too far). Attempting to move bed closer...")
+            
+            # Compute maximum distance to move: max travel of Z, minus the sensor range, plus some tolerance
+            sensor_range = 5.0  # safe default
+            dc = self.current_drive_current()
+            if self.calibrated(dc):
+                try:
+                    fmap = self.map_for_drive_current(dc)
+                    sensor_range = fmap.height_range[1]
+                except Exception:
+                    pass
+            elif self.params.calibration_z_max is not None:
+                sensor_range = self.params.calibration_z_max
+
+            tolerance = 5.0
+            max_move_distance = max(5.0, (rail_range[1] - rail_range[0]) - sensor_range + tolerance)
+            step_size = 5.0
+            moved_distance = 0.0
+
+            while now_height is None and moved_distance < max_move_distance:
+                # To move closer to the nozzle, we decrease Z coordinate.
+                # Reset toolhead Z to a safe starting coordinate (e.g. 50.0)
+                th_pos = th.get_position()
+                th_pos[2] = 50.0
+                self._set_toolhead_position(th_pos, [2])
+
+                # Perform the manual movement to Z = 50.0 - step_size (45.0)
+                target_z = 50.0 - step_size
+                th.manual_move([None, None, target_z], self.params.probe_speed)
+                th.wait_moves()
+
+                moved_distance += step_size
+                now_height = self._sampler.get_height_now()
+                self._log_msg(f"Eddy sensor out of range. Moved bed closer by {moved_distance:.1f}mm...")
+
+            if now_height is None:
+                raise self._printer.command_error(
+                    f"Couldn't get any valid samples from sensor even after moving {moved_distance:.1f}mm closer."
+                )
+            else:
+                self._log_msg(f"Eddy sensor is now in range! Detected height: {now_height:.3f}mm")
+                # Update the Z position to the actual detected height!
+                th_pos = th.get_position()
+                th_pos[2] = now_height
+                self._set_toolhead_position(th_pos, [2])
 
         self._log_debug(f"probe_to_start_position_unhomed: now: {now_height} (start {start_height})")
         if abs(now_height - start_height) <= start_height_ok_factor:
@@ -2410,13 +2460,31 @@ class ProbeEddy:
     def probe_to_start_position(self, z_pos=None):
         self._log_debug(f"probe_to_start_position (tt: {self.params.tap_threshold}, z-homed: {self._z_homed()})")
 
-        # If we're not homed at all, rely on the sensor values to bring us to
-        # a good place to start a diving probe from
-        if not self._z_homed():
-            if z_pos is not None:
-                raise self._printer.command_error("Can't probe_to_start_position with an explicit Z without homed Z")
-            self._probe_to_start_position_unhomed()
-            return
+        # Check if sensor is out of range (even if Klipper thinks Z is homed)
+        sensor_out_of_range = False
+        local_sampler = None
+        if not self.sampler_is_active():
+            local_sampler = self.start_sampler()
+
+        try:
+            sampler = self._sampler
+            now_height = sampler.get_height_now()
+            if now_height is None:
+                sensor_out_of_range = True
+
+            # If we're not homed at all, or if the sensor is out of range,
+            # run the unhomed recovery logic to move the bed closer.
+            if not self._z_homed() or sensor_out_of_range:
+                if z_pos is not None and not self._z_homed():
+                    raise self._printer.command_error("Can't probe_to_start_position with an explicit Z without homed Z")
+                self._probe_to_start_position_unhomed()
+                # If Z was not homed initially, we return here.
+                # But if Z was homed, we want to continue and move to start_z!
+                if not self._z_homed():
+                    return
+        finally:
+            if local_sampler is not None:
+                local_sampler.finish()
 
         th = self._printer.lookup_object("toolhead")
         th.wait_moves()

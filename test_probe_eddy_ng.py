@@ -104,9 +104,10 @@ def eddy_env():
     }.get(name, default)
     config.getsection.return_value = bed_mesh_config
 
-    # Patch the ProbeEddy constructor dependencies
     with patch.object(probe_eddy_ng.ProbeEddyParams, 'load_from_config'):
         eddy = probe_eddy_ng.ProbeEddy(config)
+
+    eddy._sensor._data_rate = 500.0
 
     # Initialize some default parameters
     eddy.params.calibration_z_max = 5.0
@@ -278,11 +279,22 @@ def test_cmd_setup_next_step_by_step_heating(eddy_env, room_temp, expected_comma
     eddy_env.eddy._log_calibration_sweep_data = MagicMock()
     eddy_env.eddy._log_msg = MagicMock()
 
-    # Mock sensor read_one_value return value to pass validity checks
-    val = MagicMock()
-    val.freq = 10000000.0
-    val.status = 0
-    eddy_env.eddy._sensor.read_one_value.return_value = val
+    # Mock sensor read_one_value and set_drive_current to make only 14 and 15 valid
+    current_dc = [None]
+    def mock_set_drive_current(dc):
+        current_dc[0] = dc
+    eddy_env.eddy._sensor.set_drive_current.side_effect = mock_set_drive_current
+
+    def mock_read_one_value():
+        val = MagicMock()
+        if current_dc[0] in [14, 15]:
+            val.freq = 10000000.0
+            val.status = 0
+        else:
+            val.freq = 0.0
+            val.status = 1
+        return val
+    eddy_env.eddy._sensor.read_one_value.side_effect = mock_read_one_value
 
     # Patch lookup_object
     eddy_env.printer.lookup_object.side_effect = lambda name, default=None: {
@@ -1077,4 +1089,110 @@ def test_cmd_setup_manual_z(eddy_env):
         
         callback([0.0, 0.0, 0.0])
         eddy.cmd_SETUP_next.assert_called_once_with(gcmd, [0.0, 0.0, 0.0])
+
+
+def test_probe_to_start_position_unhomed_recovery_success(eddy_env):
+    eddy = eddy_env.eddy
+    # Mock printer command_error class
+    class KlipperCommandError(Exception):
+        pass
+    eddy_env.printer.command_error = KlipperCommandError
+
+    # We mock _xy_homed to return True (required for unhomed recovery to run)
+    eddy._xy_homed = MagicMock(return_value=True)
+    eddy._z_homed = MagicMock(return_value=False)
+    eddy.calibrated = MagicMock(return_value=True)
+
+    # Mock toolhead object
+    th = MagicMock()
+    th_pos = [10.0, 20.0, 50.0]
+    th.get_position.side_effect = lambda: list(th_pos)
+    
+    th_kin = MagicMock()
+    th_kin.limits = [None, None, [0.0, 100.0]]
+    th_kin.rails = [None, None, MagicMock()]
+    th_kin.rails[2].get_range.return_value = [0.0, 100.0]
+    th.get_kinematics.return_value = th_kin
+
+    # Mock setting toolhead position
+    def mock_set_toolhead_position(pos, axes):
+        for axis in axes:
+            th_pos[axis] = pos[axis]
+    eddy._set_toolhead_position = MagicMock(side_effect=mock_set_toolhead_position)
+
+    # Patch lookup_object to return our mock toolhead
+    eddy_env.printer.lookup_object.side_effect = lambda name, default=None: {
+        "toolhead": th,
+        "configfile": eddy_env.configfile,
+    }.get(name, MagicMock())
+
+    # We mock self._sampler to be active
+    eddy.sampler_is_active = MagicMock(return_value=True)
+    eddy._sampler = MagicMock()
+    
+    # get_height_now returns None twice, then returns 1.5 (valid height) on third call
+    heights_sequence = [None, None, 1.5]
+    def mock_get_height_now():
+        if heights_sequence:
+            return heights_sequence.pop(0)
+        return 1.5
+    eddy._sampler.get_height_now.side_effect = mock_get_height_now
+
+    # Run the unhomed recovery function directly
+    eddy._probe_to_start_position_unhomed()
+
+    # The loop should execute twice (moving Z from 50 to 45, then 45 to 40), then detect height 1.5
+    # Verify that during recovery, we updated the Z position to the actual detected height (1.5)
+    set_pos_calls = [args[0][2] for args, kwargs in eddy._set_toolhead_position.call_args_list]
+    assert 1.5 in set_pos_calls
+
+    assert th.manual_move.call_count == 3
+    # Verify manual moves: manual_move([None, None, 45.0], ...) and manual_move([None, None, 40.0], ...)
+    th.manual_move.assert_any_call([None, None, 45.0], eddy.params.probe_speed)
+
+
+def test_probe_to_start_position_unhomed_recovery_failure(eddy_env):
+    eddy = eddy_env.eddy
+    class KlipperCommandError(Exception):
+        pass
+    eddy_env.printer.command_error = KlipperCommandError
+
+    eddy._xy_homed = MagicMock(return_value=True)
+    eddy._z_homed = MagicMock(return_value=False)
+    eddy.calibrated = MagicMock(return_value=True)
+
+    th = MagicMock()
+    th_pos = [10.0, 20.0, 50.0]
+    th.get_position.side_effect = lambda: list(th_pos)
+    
+    th_kin = MagicMock()
+    th_kin.limits = [None, None, [0.0, 100.0]]
+    th_kin.rails = [None, None, MagicMock()]
+    th_kin.rails[2].get_range.return_value = [0.0, 100.0]
+    th.get_kinematics.return_value = th_kin
+
+    def mock_set_toolhead_position(pos, axes):
+        for axis in axes:
+            th_pos[axis] = pos[axis]
+    eddy._set_toolhead_position = MagicMock(side_effect=mock_set_toolhead_position)
+
+    eddy_env.printer.lookup_object.side_effect = lambda name, default=None: {
+        "toolhead": th,
+        "configfile": eddy_env.configfile,
+    }.get(name, MagicMock())
+
+    eddy.sampler_is_active = MagicMock(return_value=True)
+    eddy._sampler = MagicMock()
+    
+    # get_height_now always returns None
+    eddy._sampler.get_height_now.return_value = None
+
+    # Run the function, it should raise KlipperCommandError
+    with pytest.raises(KlipperCommandError, match="Couldn't get any valid samples from sensor even after moving"):
+        eddy._probe_to_start_position_unhomed()
+
+    # It should have moved closer up to max_move_distance (100mm)
+    # Since step_size is 5.0, it should have moved 20 times
+    assert th.manual_move.call_count == 20
+
 
